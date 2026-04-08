@@ -1,7 +1,6 @@
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  ✨ GEMINI RELAY SERVER — Node.js for Render.com            ║
-// ║  Persistent memory per avatar using PostgreSQL (Neon)       ║
-// ╚══════════════════════════════════════════════════════════════╝
+// Gemini Relay Server v4 - Node.js for Render.com
+// Persistent memory per avatar using PostgreSQL (Neon)
+// Accepts custom persona from LSL notecard config
 
 const express  = require('express');
 const { Pool } = require('pg');
@@ -11,22 +10,22 @@ const app  = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── Config (set these as Environment Variables in Render) ──────
+// -- Config (set these as Environment Variables in Render) --
 const SHARED_SECRET = process.env.SHARED_SECRET || 'CHANGE_ME';
 const GEMINI_KEY    = process.env.GEMINI_KEY     || 'CHANGE_ME';
-const DATABASE_URL  = process.env.DATABASE_URL;   // Set in Render from Neon
+const DATABASE_URL  = process.env.DATABASE_URL;
 
-// ── Gemini API Config ──────────────────────────────────────────
+// -- Gemini API Config --
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
 const MAX_HISTORY = 8; // messages to keep per avatar (4 exchanges)
 
-// ── PostgreSQL Pool ────────────────────────────────────────────
+// -- PostgreSQL Pool --
 const pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
-// ── Init DB tables ─────────────────────────────────────────────
+// -- Init DB tables --
 async function initDB() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS avatar_memory (
@@ -46,10 +45,10 @@ async function initDB() {
             added TIMESTAMP DEFAULT NOW()
         );
     `);
-    console.log('✅ Database ready');
+    console.log('Database ready');
 }
 
-// ── Auth middleware ────────────────────────────────────────────
+// -- Auth middleware --
 function checkSecret(req, res, next) {
     const secret = req.body?.secret || req.query?.secret;
     if (secret !== SHARED_SECRET) {
@@ -58,23 +57,11 @@ function checkSecret(req, res, next) {
     next();
 }
 
-// ── Personality prompts ────────────────────────────────────────
-const PERSONALITIES = {
-    friendly:   'You are {NAME}, a warm, helpful, and cheerful AI assistant in Second Life. Be conversational and friendly.',
-    mystic:     'You are {NAME}, a mysterious and wise oracle in Second Life. Speak in mystical, slightly cryptic terms. Use metaphor and wisdom.',
-    sarcastic:  'You are {NAME}, a witty and sarcastic AI in Second Life. Be helpful but with a dry, clever sense of humour.',
-    guide:      'You are {NAME}, an expert Second Life guide and assistant. Give clear, practical help about Second Life and general topics.',
-    roleplay:   'You are {NAME}, an immersive roleplay character in Second Life. Stay in character and engage with the story.',
-    pirate:     'You are {NAME}, a swashbuckling pirate in Second Life. Speak like a pirate — arrr, matey! Be fun and adventurous.',
-    scientist:  'You are {NAME}, a brilliant scientist AI in Second Life. Be precise, analytical, and occasionally get excited about science.',
-    bard:       'You are {NAME}, a poetic bard in Second Life. Speak in verse when possible, be dramatic and eloquent.',
-};
-
-// ── Routes ─────────────────────────────────────────────────────
+// -- Routes --
 
 // Health check (no auth needed)
 app.get('/', (req, res) => {
-    res.json({ status: 'ok', service: 'Gemini SL Relay', version: '3.0' });
+    res.json({ status: 'ok', service: 'Gemini SL Relay', version: '4.0' });
 });
 
 // Stats
@@ -125,19 +112,25 @@ app.post('/resetall', checkSecret, async (req, res) => {
     res.json({ status: 'ok', message: 'All memories cleared.' });
 });
 
-// ── Main Chat Endpoint ─────────────────────────────────────────
+// -- Main Chat Endpoint --
 app.post('/chat', checkSecret, async (req, res) => {
     const {
         avatar_key,
         avatar_name = 'Unknown',
         message,
         ai_name = 'Gemini',
-        ai_mode = 'friendly',
+        persona,
         remember_fact,
+        // Legacy fields from older LSL versions
+        user,
     } = req.body;
 
-    if (!avatar_key || !message) {
-        return res.json({ error: 'Missing avatar_key or message' });
+    // Support both old field names (user) and new (avatar_key/avatar_name)
+    const finalKey  = avatar_key || user || 'unknown';
+    const finalName = avatar_name || user || 'Unknown';
+
+    if (!message) {
+        return res.json({ error: 'Missing message' });
     }
 
     try {
@@ -145,38 +138,54 @@ app.post('/chat', checkSecret, async (req, res) => {
         if (remember_fact) {
             await pool.query(
                 'INSERT INTO avatar_memory (avatar_key, avatar_name, facts) VALUES ($1,$2,$3) ON CONFLICT (avatar_key) DO UPDATE SET facts = avatar_memory.facts || $4, last_seen = NOW()',
-                [avatar_key, avatar_name, remember_fact + '\n', '\n' + remember_fact]
+                [finalKey, finalName, remember_fact + '\n', '\n' + remember_fact]
             );
-            return res.json({ reply: `Got it! I'll remember: ${remember_fact}` });
+            return res.json({ reply: `Got it! I will remember: ${remember_fact}` });
         }
 
         // Get or create avatar record
         await pool.query(
             'INSERT INTO avatar_memory (avatar_key, avatar_name) VALUES ($1,$2) ON CONFLICT (avatar_key) DO UPDATE SET avatar_name=$2, last_seen=NOW()',
-            [avatar_key, avatar_name]
+            [finalKey, finalName]
         );
 
         const row = await pool.query(
-            'SELECT history, facts FROM avatar_memory WHERE avatar_key=$1',
-            [avatar_key]
+            'SELECT history, facts, total_chats FROM avatar_memory WHERE avatar_key=$1',
+            [finalKey]
         );
 
         let history = JSON.parse(row.rows[0].history || '[]');
         const avatarFacts = row.rows[0].facts || '';
+        const totalChats = row.rows[0].total_chats || 0;
 
         // Get global facts
         const gfResult = await pool.query('SELECT fact FROM global_facts ORDER BY added');
         const globalFacts = gfResult.rows.map(r => r.fact).join('\n');
 
         // Build system prompt
-        const modeTemplate = PERSONALITIES[ai_mode] || PERSONALITIES.friendly;
-        let systemPrompt = modeTemplate.replace(/{NAME}/g, ai_name);
-        systemPrompt += `\n\nYou are speaking with ${avatar_name} in Second Life.`;
-        systemPrompt += '\nKeep responses concise (under 200 chars ideally — SL chat is short).';
-        systemPrompt += '\nNever use markdown formatting like ** or ## — plain text only.';
+        // If LSL sent a custom persona (from notecard), use that directly
+        // Otherwise use a default
+        let systemPrompt;
+        if (persona && persona.length > 0) {
+            systemPrompt = persona;
+        } else {
+            systemPrompt = 'You are ' + ai_name + ', a friendly AI assistant in Second Life.';
+        }
 
-        if (globalFacts) systemPrompt += `\n\nWorld/location facts:\n${globalFacts}`;
-        if (avatarFacts) systemPrompt += `\n\nFacts about ${avatar_name}:\n${avatarFacts}`;
+        systemPrompt += '\n\nYou are speaking with ' + finalName + ' in Second Life.';
+
+        if (totalChats > 0) {
+            systemPrompt += '\nYou have chatted with ' + finalName + ' ' + totalChats + ' times before.';
+        } else {
+            systemPrompt += '\nThis is your first time meeting ' + finalName + '.';
+        }
+
+        systemPrompt += '\nKeep responses concise (under 200 chars ideally - SL chat is short).';
+        systemPrompt += '\nNever use markdown formatting like ** or ## - plain text only.';
+        systemPrompt += '\nDo not use emoji or special unicode characters.';
+
+        if (globalFacts) systemPrompt += '\n\nWorld/location facts:\n' + globalFacts;
+        if (avatarFacts) systemPrompt += '\n\nFacts about ' + finalName + ':\n' + avatarFacts;
 
         // Build contents array for Gemini
         const contents = [];
@@ -231,7 +240,7 @@ app.post('/chat', checkSecret, async (req, res) => {
         // Save back to DB
         await pool.query(
             'UPDATE avatar_memory SET history=$1, total_chats=total_chats+1, last_seen=NOW() WHERE avatar_key=$2',
-            [JSON.stringify(history), avatar_key]
+            [JSON.stringify(history), finalKey]
         );
 
         res.json({ reply: reply });
@@ -242,9 +251,9 @@ app.post('/chat', checkSecret, async (req, res) => {
     }
 });
 
-// ── Start ──────────────────────────────────────────────────────
+// -- Start --
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     await initDB();
-    console.log(`🚀 Gemini SL Relay running on port ${PORT}`);
+    console.log('Gemini SL Relay v4 running on port ' + PORT);
 });
